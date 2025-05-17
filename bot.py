@@ -1,111 +1,157 @@
 import os
-import threading
+import asyncio
 import traceback
-import time
-import requests
+import tempfile
+import uuid
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Читаем токен из env
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+# ------------  Настройка токена  ------------
 
-# Храним учётки и chat_id
-# Format: {chat_id: (login, password)}
-user_credentials: dict[int, tuple[str, str]] = {}
+# Если используете локально, создайте .env рядом и напишите в нём:
+# TELEGRAM_TOKEN=ваш_токен
+# а затем раскомментируйте:
+# from dotenv import load_dotenv
+# load_dotenv()
 
-# Последнее число непрочитанных по каждому чату
-last_unread: dict[int, dict[str,int]] = {}
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
 
-def send_telegram(chat_id: int, text: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": chat_id, "text": text})
+# ------------  Память  ------------
 
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id, f"Ваш chat_id: {chat_id}\n"
+# По chat_id храним { login, password, last_counts }
+USER_CFG: dict[int, dict] = {}
+
+# ------------  Обработчики  ------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Ваш chat_id: {update.effective_chat.id!r}\n"
         "Чтобы настроить бота, отправьте:\n"
         "/set <логин> <пароль>\n"
-        "Пример: /set abc_d 1234")
+        "Пример: /set abc_d 1234"
+    )
 
-async def set_credentials(update, context: ContextTypes.DEFAULT_TYPE):
+async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    try:
-        login, pwd = context.args
-    except ValueError:
-        return await context.bot.send_message(chat_id, "Используйте: /set логин пароль")
-    user_credentials[chat_id] = (login, pwd)
-    last_unread[chat_id] = {}
-    await context.bot.send_message(chat_id, "Данные сохранены! Проверка запускается каждые 60 секунд.")
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Используйте: /set логин пароль")
+        return
 
-def check_messages(login: str, password: str, chat_id: int):
+    login, password = args
+    USER_CFG[chat_id] = {
+        "login": login,
+        "password": password,
+        "last_counts": {}
+    }
+
+    # Запускаем фоновую задачу (если она уже была — она переедет)
+    context.job_queue.run_repeating(
+        check_job,
+        interval=60,
+        first=0,
+        chat_id=chat_id,
+    )
+
+    await update.message.reply_text(
+        "Данные сохранены! Проверка запущена каждые 60 секунд."
+    )
+
+# ------------  Фонная задача  ------------
+
+async def check_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    cfg = USER_CFG.get(chat_id)
+    if not cfg:
+        return
+
+    try:
+        new_counts = fetch_unread_counts(cfg["login"], cfg["password"])
+        diffs = []
+        total_new = 0
+
+        for name, cnt in new_counts.items():
+            prev = cfg["last_counts"].get(name, 0)
+            if cnt > prev:
+                diffs.append(f"{name}: {cnt - prev}")
+                total_new += cnt - prev
+
+        if diffs:
+            text = f"🔔 У вас {total_new} новых сообщений:\n" + "\n".join(diffs)
+            await context.bot.send_message(chat_id=chat_id, text=text)
+
+        cfg["last_counts"] = new_counts
+
+    except Exception:
+        tb = traceback.format_exc()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❗ Ошибка при проверке:\n" + tb[:2000]
+        )
+
+# ------------  Selenium-логика  ------------
+
+def fetch_unread_counts(login: str, password: str) -> dict[str, int]:
+    """
+    Логинимся и возвращаем {название_диалога: число_непрочитанных, ...}
+    """
+
+    # Собираем опции Chrome
     options = Options()
     options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
-    # уникальный user-data-dir, чтобы selenium не падал
-    options.add_argument(f"--user-data-dir=/tmp/user{chat_id}")
+
+    # Уникальный каталог профиля, чтобы не было коллизий
+    profile_dir = tempfile.mkdtemp(prefix="chrome-profile-")
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
     driver = webdriver.Chrome(options=options)
-    driver.get("https://cabinet.nf.uust.ru/chat/index")
-    # ждем список чатов
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li.room.nav-item"))
-    )
-    # авторизуемся
-    driver.find_element(By.NAME, "login").send_keys(login)
-    driver.find_element(By.NAME, "password").send_keys(password)
-    driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
+    try:
+        # 1) Открываем страницу логина
+        driver.get("https://cabinet.nf.ваш_домен/chat/index")
 
-    # собираем все непрочитанные
-    elems = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-    counts = {}
-    for el in elems:
-        cnt = int(el.text)
-        # имя чата берём у родителя
-        name = el.find_element(By.XPATH, "./ancestor::a").text.strip()
-        counts[name] = cnt
+        # 2) Вводим логин/пароль и нажимаем кнопку
+        driver.find_element(By.CSS_SELECTOR, "#login_input").send_keys(login)
+        driver.find_element(By.CSS_SELECTOR, "#password_input").send_keys(password)
+        driver.find_element(By.CSS_SELECTOR, "#login_button").click()
 
-    driver.quit()
+        # 3) Ждём загрузки списка чатов
+        driver.implicitly_wait(10)
+        # 4) Считываем непрочитанные
+        badges = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
+        titles = driver.find_elements(By.CSS_SELECTOR, "a.room.nav-item")
+        result: dict[str, int] = {}
+        for title_el, badge_el in zip(titles, badges):
+            name = title_el.text.strip()
+            count = int(badge_el.text.strip())
+            result[name] = count
 
-    prev = last_unread.get(chat_id, {})
-    diffs = []
-    for name, cnt in counts.items():
-        old = prev.get(name, 0)
-        if cnt > old:
-            diffs.append(f"{name}: {cnt-old}")
-    last_unread[chat_id] = counts
+        return result
 
-    if diffs:
-        text = "🔔 У вас новые сообщения:\n" + "\n".join(diffs)
-        send_telegram(chat_id, text)
+    finally:
+        driver.quit()
 
-def background_loop():
-    while True:
-        for chat_id, (login, pwd) in user_credentials.items():
-            try:
-                check_messages(login, pwd, chat_id)
-            except Exception:
-                traceback.print_exc()
-                send_telegram(chat_id, "Ошибка при проверке сообщений.")
-        time.sleep(60)
+# ------------  Запуск бота  ------------
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("set", set_credentials))
+    app.add_handler(CommandHandler("set", set_cmd))
 
-    # Запускаем фон
-    threading.Thread(target=background_loop, daemon=True).start()
-
-    # Запускаем бота
-    # drop_pending_updates по умолчанию = True
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
