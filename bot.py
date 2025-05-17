@@ -1,116 +1,110 @@
 import os
-import time
-import threading
-from dotenv import load_dotenv
-
+import asyncio
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+import requests
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Подгружаем переменные из .env
-load_dotenv()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+user_credentials: dict[int, tuple[str, str]] = {}
 
-# словарь chat_id → (login, password)
-user_credentials: dict[str, tuple[str, str]] = {}
-# словарь chat_id → {chat_name: last_count}
-last_unread: dict[str, dict[str, int]] = {}
 
-def send_telegram(chat_id: str, text: str):
-    import requests
+async def send_telegram(chat_id: int, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": chat_id, "text": text})
 
-def check_messages(login: str, password: str, chat_id: str):
+
+def check_messages(login: str, password: str, chat_id: int) -> None:
+    """
+    Открываем ЛК, забираем бейджи с непрочитанными сообщениями
+    и шлём их в Telegram.
+    """
     options = Options()
-    # options.add_argument("--headless")  # раскомментируйте для невидимого режима
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    # Вот здесь — даём каждому запуску свой каталог данных:
+    profile_dir = f"/tmp/selenium_profile_{chat_id}"
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
     driver = webdriver.Chrome(options=options)
-
     try:
-        # 1) Логинимся
-        driver.get("https://cabinet.nf.uust.ru")
-        time.sleep(2)
+        driver.get("https://cabinet.nf.uust.ru/login")
         driver.find_element(By.ID, "login").send_keys(login)
-        driver.find_element(By.ID, "password").send_keys(password)
-        driver.find_element(By.ID, "password").send_keys(Keys.RETURN)
-        time.sleep(3)
+        driver.find_element(By.ID, "password").send_keys(password + Keys.RETURN)
 
-        # 2) Открываем список конференций
-        driver.get("https://cabinet.nf.uust.ru/chat/index")
-        time.sleep(5)  # ждём подгрузки JS
+        WebDriverWait(driver, 10).until(EC.url_contains("/chat/index"))
 
-        # 3) Снимаем текущее число непрочитанных по каждому чату
         badges = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-        current: dict[str,int] = {}
-        for b in badges:
-            txt = b.text.strip()
-            if txt.isdigit() and int(txt) > 0:
-                name = b.find_element(By.XPATH, "./ancestor::a").text.replace(txt, "").strip()
-                current[name] = int(txt)
+        if not badges:
+            return
 
-    except Exception as e:
-        print(f"[{chat_id}] Ошибка при проверке: {e}")
-        driver.quit()
-        return
+        text = f"🔔 У вас {len(badges)} новых сообщений:\n"
+        for b in badges:
+            parent = b.find_element(By.XPATH, "../..")
+            title = parent.find_element(By.CSS_SELECTOR, "a").text.strip()
+            cnt = b.text.strip()
+            text += f"{title}: {cnt}\n"
+
+        asyncio.run(send_telegram(chat_id, text))
     finally:
         driver.quit()
 
-    # 4) Сравниваем с предыдущим состоянием и шлём только новые
-    prev = last_unread.get(chat_id, {})
-    last_unread[chat_id] = current
 
-    if not prev:
-        # первый запуск — инициализируем без уведомлений
-        print(f"[{chat_id}] Инициализировано: {current}")
-        return
-
-    diffs = []
-    for name, cnt in current.items():
-        old = prev.get(name, 0)
-        if cnt > old:
-            diffs.append(f"{name}: +{cnt - old}")
-
-    if diffs:
-        send_telegram(chat_id, "🔔 Новые сообщения:\n" + "\n".join(diffs))
-    else:
-        print(f"[{chat_id}] Ничего нового")
-
-# --- обработчик /start ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"Ваш chat_id: {cid}\n"
+        f"Ваш chat_id: {chat_id}\n"
         "Чтобы настроить бота, отправьте:\n"
         "/set <логин> <пароль>\n"
         "Пример: /set abc_d 1234"
     )
 
-# --- обработчик /set логин пароль ---
-async def set_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    cid = str(update.effective_chat.id)
-    if len(args) != 2:
-        return await update.message.reply_text("Используйте: /set логин пароль")
-    user_credentials[cid] = (args[0], args[1])
-    last_unread.pop(cid, None)  # сбрасываем старое состояние
+
+async def set_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if len(context.args) != 2:
+        await update.message.reply_text("Используйте: /set <логин> <пароль>")
+        return
+
+    login, pwd = context.args
+    user_credentials[chat_id] = (login, pwd)
     await update.message.reply_text("Данные сохранены! Проверка запущена каждые 60 секунд.")
 
-# --- фоновая проверка ---
-def background_loop():
-    while True:
-        for cid, (login, pwd) in user_credentials.items():
-            check_messages(login, pwd, cid)
-        time.sleep(60)
+    # Планируем периодическую задачу
+    context.job_queue.run_repeating(
+        lambda ctx: check_messages(login, pwd, chat_id),
+        interval=60,
+        first=0,
+        name=str(chat_id),
+    )
 
-# --- точка входа ---
-if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+def main() -> None:
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .drop_pending_updates(True)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("set", set_credentials))
 
-    threading.Thread(target=background_loop, daemon=True).start()
     app.run_polling()
+
+
+if  __name__ == "__main__":
+    main()
