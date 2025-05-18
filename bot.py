@@ -1,12 +1,10 @@
 import os
-import asyncio
+import logging
 import traceback
-import tempfile
-import uuid
-
+import requests
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 
 from telegram import Update
 from telegram.ext import (
@@ -15,143 +13,132 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ------------  Настройка токена  ------------
+# ==== 1) Загрузка .env (только для локальной разработки) ====
+load_dotenv()  # автоматически читает .env в корне проекта
 
-# Если используете локально, создайте .env рядом и напишите в нём:
-# TELEGRAM_TOKEN=ваш_токен
-# а затем раскомментируйте:
-# from dotenv import load_dotenv
-# load_dotenv()
+# ==== 2) Токен из окружения ====
+TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
+# ==== 3) Логирование ====
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s %(message)s',
+    level=logging.INFO
+)
 
-# ------------  Память  ------------
+# ==== 4) Хранилища состояний ====
+user_credentials: dict[int, tuple[str, str]] = {}
+last_counts:       dict[int, int] = {}
+error_notified:    dict[int, bool] = {}
 
-# По chat_id храним { login, password, last_counts }
-USER_CFG: dict[int, dict] = {}
 
-# ------------  Обработчики  ------------
+async def send_telegram(chat_id: int, text: str):
+    """Простая обёртка вокруг sendMessage API."""
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    try:
+        requests.post(url, data={'chat_id': chat_id, 'text': text})
+    except Exception:
+        logging.exception("Не смогли отправить Telegram-сообщение")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def check_messages(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Еженоминутная задача: логинимся в кабинет,
+    собираем общее число непрочитанных, сравниваем с прошлым,
+    шлём уведомление или ошибку один раз.
+    """
+    chat_id = context.job.chat_id
+    creds = user_credentials.get(chat_id)
+    if creds is None:
+        return  # ещё не настроено
+
+    login, password = creds
+
+    try:
+        # === Настраиваем selenium ===
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-gpu')
+        driver = webdriver.Chrome(options=options)
+
+        # === Логинимся ===
+        driver.get('https://cabinet.ni.ifnt.ru/chat/')
+        # TODO: тут ваш код заполнения полей login/password и входа
+
+        # === Считаем непрочитанные ===
+        elems = driver.find_elements_by_css_selector('span.badge.room-unread.pull-right')
+        counts = [int(e.text) for e in elems if e.text.isdigit()]
+        total = sum(counts)
+
+        prev = last_counts.get(chat_id)
+        if prev is None or total != prev:
+            if total > 0:
+                # шлём уведомление с деталями
+                msg = f"🔔 У вас {total} новых сообщений:\n"
+                # Собрать подписи к каждому чату можно через соседние элементы DOM
+                names = driver.find_elements_by_css_selector('a.room-name-selector')  # пример
+                for name_el, cnt in zip(names, counts):
+                    msg += f"{name_el.text}: {cnt}\n"
+                await send_telegram(chat_id, msg)
+
+            last_counts[chat_id] = total
+
+        # Сброс флага ошибки, если всё прошло успешно
+        error_notified[chat_id] = False
+
+    except Exception:
+        logging.exception("Ошибка при check_messages")
+        # шлём сообщение об ошибке только один раз подряд
+        if not error_notified.get(chat_id, False):
+            await send_telegram(chat_id, "Ошибка при проверке сообщений.")
+            error_notified[chat_id] = True
+
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"Ваш chat_id: {update.effective_chat.id!r}\n"
-        "Чтобы настроить бота, отправьте:\n"
+        f"Ваш chat_id: {chat_id}\n"
+        "Чтобы настроить бота — отправьте:\n"
         "/set <логин> <пароль>\n"
         "Пример: /set abc_d 1234"
     )
 
+
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    args = context.args
+    args = context.args or []
     if len(args) != 2:
-        await update.message.reply_text("Используйте: /set логин пароль")
+        await update.message.reply_text("Используйте: /set <логин> <пароль>")
         return
 
-    login, password = args
-    USER_CFG[chat_id] = {
-        "login": login,
-        "password": password,
-        "last_counts": {}
-    }
-
-    # Запускаем фоновую задачу (если она уже была — она переедет)
-    context.job_queue.run_repeating(
-        check_job,
-        interval=60,
-        first=0,
-        chat_id=chat_id,
-    )
-
+    login, pwd = args
+    user_credentials[chat_id] = (login, pwd)
+    last_counts[chat_id] = None
+    error_notified[chat_id] = False
     await update.message.reply_text(
         "Данные сохранены! Проверка запущена каждые 60 секунд."
     )
+    # запускаем задачу в JobQueue
+    context.job_queue.run_repeating(
+        check_messages,
+        interval=60,       # раз в 60 секунд
+        first=0,           # сразу запустить
+        chat_id=chat_id    # чтобы знать, для какого чата
+    )
 
-# ------------  Фонная задача  ------------
 
-async def check_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    cfg = USER_CFG.get(chat_id)
-    if not cfg:
-        return
-
-    try:
-        new_counts = fetch_unread_counts(cfg["login"], cfg["password"])
-        diffs = []
-        total_new = 0
-
-        for name, cnt in new_counts.items():
-            prev = cfg["last_counts"].get(name, 0)
-            if cnt > prev:
-                diffs.append(f"{name}: {cnt - prev}")
-                total_new += cnt - prev
-
-        if diffs:
-            text = f"🔔 У вас {total_new} новых сообщений:\n" + "\n".join(diffs)
-            await context.bot.send_message(chat_id=chat_id, text=text)
-
-        cfg["last_counts"] = new_counts
-
-    except Exception:
-        tb = traceback.format_exc()
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❗ Ошибка при проверке:\n" + tb[:2000]
-        )
-
-# ------------  Selenium-логика  ------------
-
-def fetch_unread_counts(login: str, password: str) -> dict[str, int]:
-    """
-    Логинимся и возвращаем {название_диалога: число_непрочитанных, ...}
-    """
-
-    # Собираем опции Chrome
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-
-    # Уникальный каталог профиля, чтобы не было коллизий
-    profile_dir = tempfile.mkdtemp(prefix="chrome-profile-")
-    options.add_argument(f"--user-data-dir={profile_dir}")
-
-    driver = webdriver.Chrome(options=options)
-    try:
-        # 1) Открываем страницу логина
-        driver.get("https://cabinet.nf.ваш_домен/chat/index")
-
-        # 2) Вводим логин/пароль и нажимаем кнопку
-        driver.find_element(By.CSS_SELECTOR, "#login_input").send_keys(login)
-        driver.find_element(By.CSS_SELECTOR, "#password_input").send_keys(password)
-        driver.find_element(By.CSS_SELECTOR, "#login_button").click()
-
-        # 3) Ждём загрузки списка чатов
-        driver.implicitly_wait(10)
-        # 4) Считываем непрочитанные
-        badges = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-        titles = driver.find_elements(By.CSS_SELECTOR, "a.room.nav-item")
-        result: dict[str, int] = {}
-        for title_el, badge_el in zip(titles, badges):
-            name = title_el.text.strip()
-            count = int(badge_el.text.strip())
-            result[name] = count
-
-        return result
-
-    finally:
-        driver.quit()
-
-# ------------  Запуск бота  ------------
-
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("set",   set_cmd))
+    app.run_polling()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("set", set_cmd))
-
-    await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
