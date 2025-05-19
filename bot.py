@@ -10,30 +10,34 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ——— Настройка логов ———
+# ——— Настройка логирования ———
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ——— Токен бота из переменных окружения ———
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
-    logger.error("TELEGRAM_TOKEN не задан в окружении")
+    logger.error("TELEGRAM_TOKEN не задан")
     exit(1)
 
-# По chat_id храним (login, password)
+# ——— Хранилища состояний по chat_id ———
 user_credentials: dict[int, tuple[str, str]] = {}
-# По chat_id храним последнее число непрочитанных
-last_counts: dict[int, int] = {}
-# Флаг, чтобы не спамить ошибками
-error_sent: dict[int, bool] = {}
+last_counts:       dict[int, int] = {}
+error_sent:        dict[int, bool] = {}
 
+# ——— /start — сброс старых данных и инструкция ———
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # очистка
+    # отменяем все старые задачи и очищаем данные
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     user_credentials.pop(chat_id, None)
@@ -46,20 +50,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set <логин> <пароль>"
     )
 
+# ——— /set — сохраняем логин/пароль и запускаем проверку ———
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if len(context.args) != 2:
         return await update.message.reply_text("Используйте: /set <логин> <пароль>")
+
     login, pwd = context.args
     user_credentials[chat_id] = (login, pwd)
     last_counts[chat_id] = 0
     error_sent[chat_id] = False
 
-    # отменяем старые задачи
+    # удаляем предыдущие задачи
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    # ставим новую задачу
+    # планируем новую задачу: сразу и потом каждые 60 секунд
     context.application.job_queue.run_repeating(
         callback=check_messages,
         interval=60,
@@ -67,16 +73,18 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=str(chat_id),
         data=chat_id
     )
-    await update.message.reply_text("Данные приняты, проверка каждые 60 секунд.")
 
+    await update.message.reply_text("Данные сохранены! Проверка каждые 60 секунд.")
+
+# ——— Глобальный обработчик ошибок — подавляет Conflict ———
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    # подавляем Telegram-409 Conflict
     from telegram.error import Conflict
     if isinstance(context.error, Conflict):
-        logger.warning("Игнорируем Conflict от getUpdates")
+        logger.warning("Игнорируем Conflict при getUpdates")
     else:
         logger.error("Необработанная ошибка:", exc_info=context.error)
 
+# ——— Функция проверки — логинимся и парсим бейджи ———
 async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     chat_id: int = context.job.data
     creds = user_credentials.get(chat_id)
@@ -85,43 +93,43 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         return
     login, pwd = creds
 
-    # настройка Chromium
+    # Настройка headless Chromium из apt-пакетов
     opts = Options()
     opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=opts)
 
     try:
-        # 1) авторизация
+        # 1) Авторизация
         driver.get("https://cabinet.nf.uust.ru/")
         WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.ID, "login")))
         driver.find_element(By.ID, "login").send_keys(login)
         driver.find_element(By.ID, "password").send_keys(pwd)
         driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+        time.sleep(1)
 
-        # 2) дождаться перехода в чат
-        WebDriverWait(driver, 10).until(EC.url_contains("/chat/index"))
-        logger.info(f"[{chat_id}] Успешный вход, URL: {driver.current_url}")
-
-        # 3) считываем бейджи
+        # 2) Переходим в «Конференции»
+        chat_url = "https://cabinet.nf.uust.ru/chat/index"
+        driver.get(chat_url)
+        logger.info(f"[{chat_id}] Зашли на {chat_url}")
+        # 3) Ждём и читаем бейджи непрочитанных
         WebDriverWait(driver, 10).until(
-            EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-            )
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "span.badge.room-unread.pull-right"))
         )
         elems = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
         count = sum(int(e.text) for e in elems if e.text.isdigit())
-        logger.info(f"[{chat_id}] Найдено бейджей: {len(elems)}, count={count}")
+        logger.info(f"[{chat_id}] Бейджей: {len(elems)}, count={count}")
 
+        # 4) Отправляем уведомление только при увеличении
         prev = last_counts.get(chat_id, 0)
         if count > prev:
-            diff = count - prev
             await context.bot.send_message(
                 chat_id,
-                f"🔔 У вас {diff} новых сообщений (всего {count})."
+                f"🔔 У вас {count - prev} новых сообщений (всего {count})."
             )
             last_counts[chat_id] = count
         error_sent[chat_id] = False
@@ -135,6 +143,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     finally:
         driver.quit()
 
+# ——— Точка входа — сборка приложения и запуск polling ———
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
