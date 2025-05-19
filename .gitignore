@@ -1,2 +1,9 @@
+# Секреты
 .env
-__pycache__/
+
+# Python байткод
+pycache/
+*.py[cod]
+
+# Локальные webdriver-бинари
+chromedriver
