@@ -13,10 +13,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ——— Логирование ———
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s:%(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ——— Токен из окружения ———
@@ -58,7 +55,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    # планируем новую задачу: сразу и потом каждые 60 секунд
+    # планируем новую задачу
     context.application.job_queue.run_repeating(
         callback=check_messages,
         interval=60,
@@ -83,7 +80,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         return
     login, pwd = creds
 
-    # Настройка headless Chromium
+    # headless Chrome
     opts = Options()
     opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless")
@@ -96,9 +93,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     try:
         # 1) Авторизация
         driver.get("https://cabinet.nf.uust.ru/")
-        WebDriverWait(driver, 15).until(
-            EC.visibility_of_element_located((By.ID, "login"))
-        )
+        WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.ID, "login")))
         driver.find_element(By.ID, "login").send_keys(login)
         driver.find_element(By.ID, "password").send_keys(pwd)
         driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
@@ -109,26 +104,25 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         driver.get(chat_url)
         logger.info(f"[{chat_id}] Зашли на {chat_url}")
 
-        # 3) Ждём появления бейджей
+        # 3) Собираем только видимые бейджи с непустым текстом
         WebDriverWait(driver, 15).until(
             EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
+                (By.XPATH, "//span[contains(@class,'badge') and normalize-space(string())!='']")
             )
         )
-        elems = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-        # Фильтруем только видимые бейджи с цифрами
+        elems = driver.find_elements(
+            By.XPATH, "//span[contains(@class,'badge') and normalize-space(string())!='']"
+        )
         count = 0
-        visible_with_digits = 0
         for e in elems:
             if not e.is_displayed():
                 continue
-            text = e.text.strip()
-            if text.isdigit():
-                visible_with_digits += 1
-                count += int(text)
-                logger.info(f"[{chat_id}] Непрочитанных в бейдже: {text}")
+            txt = e.text.strip()
+            if txt.isdigit():
+                count += int(txt)
+                logger.info(f"[{chat_id}] Непрочитанных в бейдже: {txt}")
 
-        logger.info(f"[{chat_id}] Всего бейджей в DOM: {len(elems)}, видимых с цифрами: {visible_with_digits}, count={count}")
+        logger.info(f"[{chat_id}] Итоговое число непрочитанных: {count}")
 
         prev = last_counts.get(chat_id, 0)
         if count > prev:
@@ -144,6 +138,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         if not error_sent.get(chat_id, False):
             await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
             error_sent[chat_id] = True
+
     finally:
         driver.quit()
 
