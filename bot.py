@@ -1,5 +1,6 @@
 import os
 import logging
+import traceback
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -9,92 +10,126 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    JobQueue,
 )
 
-# Настройка логирования
+# ——— Настройка логов ———
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Токен читаем из переменных окружения
+# ——— Токен из окружения ———
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN не задана в окружении")
+    exit(1)
 
-# Хранилище логинов/паролей и предыдущих значений
+# ——— Хранилища состояний ———
 user_credentials: dict[int, tuple[str, str]] = {}
-last_counts: dict[int, int] = {}
+last_counts:       dict[int, int] = {}
+ERROR_SENT:        dict[int, bool] = {}
+
+CHECK_INTERVAL = 60  # секунд
+
+def create_driver() -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    return webdriver.Chrome(options=opts)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает /start."""
-    await update.message.reply_text(
-        f"Ваш chat_id: {update.effective_chat.id}\n"
-        "Чтобы настроить бота, отправьте:\n"
-        "/set <логин> <пароль>\n"
-        "Пример: /set abc_d 1234"
+    chat_id = update.effective_chat.id
+    await context.bot.send_message(
+        chat_id,
+        f"Ваш chat_id: {chat_id}\n"
+        "Чтобы начать, отправьте:\n"
+        "/set <логин> <пароль>"
     )
+    # очистим старые задачи/статы
+    user_credentials.pop(chat_id, None)
+    last_counts.pop(chat_id, None)
+    ERROR_SENT.pop(chat_id, None)
+    # удаляем все job-и этого чата
+    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает /set, сохраняет логин/пароль и запускает задачу."""
     chat_id = update.effective_chat.id
-    args = context.args
-    if len(args) != 2:
-        return await update.message.reply_text("Используйте: /set логин пароль")
+    if len(context.args) != 2:
+        return await context.bot.send_message(chat_id, "Используйте: /set <логин> <пароль>")
+    login, pwd = context.args
+    user_credentials[chat_id] = (login, pwd)
+    last_counts[chat_id] = 0
+    ERROR_SENT[chat_id] = False
 
-    login, password = args
-    user_credentials[chat_id] = (login, password)
-    await update.message.reply_text("Данные сохранены! Проверка запущена каждые 60 секунд.")
+    # удаляем предыдущие задачи
+    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
 
-    # запускаем или перезапускаем задачу
-    # при повторном /set предыдущая отменится автоматически
-    context.job_queue.run_repeating(
-        check_messages,
-        interval=60,
-        first=0,
-        data=chat_id,
-        name=str(chat_id)  # уникально по chat_id
+    # запускаем новую задачу
+    context.application.job_queue.run_repeating(
+        callback=check_messages,
+        interval=CHECK_INTERVAL,
+        first=5,
+        name=str(chat_id),
+        data=chat_id
     )
 
-async def check_messages(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет сообщения по логину/паролю, присланным в /set."""
-    chat_id = int(context.job.data)
-    login, password = user_credentials.get(chat_id, (None, None))
+    await context.bot.send_message(chat_id, f"Данные сохранены! Проверка раз в {CHECK_INTERVAL} сек.")
 
-    if not login or not password:
-        # если нет данных — отменяем задачу и выходим
+async def check_messages(context: ContextTypes.DEFAULT_TYPE):
+    chat_id: int = context.job.data
+    creds = user_credentials.get(chat_id)
+    if not creds:
+        # если нет creds — отменяем
         context.job.schedule_removal()
         return
 
+    login, pwd = creds
     try:
-        # Здесь ваш код проверки через selenium или requests.
-        # Приведу заглушку:
-        # driver = webdriver.Chrome(options=Options().add_argument("--headless"))
-        # ... логинимся, парсим ...
-        #
-        # count = ...  # новое значение
-        #
-        # if count != last_counts.get(chat_id):
-        #     await context.bot.send_message(chat_id, f"Новое число: {count}")
-        #     last_counts[chat_id] = count
-        #
-        raise RuntimeError("заглушка ошибки для примера")
+        driver = create_driver()
+        # --- Ваша логика авторизации и парсинга ---
+        driver.get("https://cabinet.nf.uust.ru/chat/index")
+        # driver.find_element(...).send_keys(login)
+        # driver.find_element(...).send_keys(pwd)
+        # driver.find_element(...).click()
+        # далее находим бейджи с классом .badge.room-unread.pull-right
+        elems = driver.find_elements("css selector", "span.badge.room-unread.pull-right")
+        total = sum(int(e.text) for e in elems if e.text.isdigit())
+        driver.quit()
+
+        prev = last_counts.get(chat_id, 0)
+        if total != prev:
+            # только при изменении шлём
+            if total > 0:
+                await context.bot.send_message(
+                    chat_id,
+                    f"🔔 У вас {total} непрочитанных сообщений."
+                )
+            last_counts[chat_id] = total
+        ERROR_SENT[chat_id] = False  # сброс флага ошибки
 
     except Exception as e:
         logger.exception("Ошибка в check_messages")
-        await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
+        if not ERROR_SENT.get(chat_id, False):
+            await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
+            ERROR_SENT[chat_id] = True
+        try:
+            driver.quit()
+        except:
+            pass
 
-async def main():
-    # собираем приложение
+def main():
+    # создаём приложение
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # регистрируем хендлеры
+    # регистрируем команды
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("set", set_cmd))
+    app.add_handler(CommandHandler("set",   set_cmd))
 
-    # запускаем long polling
-    await app.run_polling()
+    # стартуем polling (собственно запускает цикл событий и не вылетает)
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()

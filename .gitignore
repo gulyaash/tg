@@ -1,5 +1,2 @@
 .env
-pycache/
-*.pyc
-chromedriver
-chrome-profile-*
+__pycache__/
