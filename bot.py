@@ -14,28 +14,28 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ——— Настройка логирования ———
+# ——— Логи ———
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ——— Токен бота из окружения ———
+# ——— Токен из окружения ———
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN не задан")
     exit(1)
 
-# ——— Хранилища состояний по chat_id ———
+# ——— Состояния по chat_id ———
 user_credentials: dict[int, tuple[str, str]] = {}
 last_counts:       dict[int, int] = {}
 error_sent:        dict[int, bool] = {}
 
-# ——— /start — сброс старых данных и инструктаж ———
+# ——— /start — сброс и инструкция ———
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # отменяем все старые задачи
+    # убираем старые задачи и данные
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     user_credentials.pop(chat_id, None)
@@ -48,7 +48,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set <логин> <пароль>"
     )
 
-# ——— /set — сохраняем креды и стартуем JobQueue ———
+# ——— /set — сохраняем креды и запускаем проверку ———
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if len(context.args) != 2:
@@ -58,11 +58,11 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_counts[chat_id] = 0
     error_sent[chat_id] = False
 
-    # отменяем прежние задачи
+    # удаляем предыдущие задачи
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    # планируем новую — сразу и потом каждые 60 сек
+    # планируем новую задачу: сразу и далее каждые 60 сек
     context.application.job_queue.run_repeating(
         callback=check_messages,
         interval=60,
@@ -72,7 +72,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("Данные сохранены! Проверка каждые 60 секунд.")
 
-# ——— Глобальный обработчик ошибок — подавляет Conflict ———
+# ——— Глобальный ErrorHandler — подавляет Conflict ———
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     from telegram.error import Conflict
     if isinstance(context.error, Conflict):
@@ -80,7 +80,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     else:
         logger.error("Необработанная ошибка:", exc_info=context.error)
 
-# ——— Функция проверки — логинимся и считаем бейджи ———
+# ——— Функция проверки — логин и парсинг ———
 async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     chat_id: int = context.job.data
     creds = user_credentials.get(chat_id)
@@ -89,7 +89,6 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         return
     login, pwd = creds
 
-    # headless Chrome из apt-пакетов
     opts = Options()
     opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless")
@@ -99,17 +98,20 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=opts)
     try:
-        driver.get("https://cabinet.nf.uust.ru/chat/index")
-        # авторизация
-        driver.find_element(By.NAME, "login").send_keys(login)
-        driver.find_element(By.NAME, "password").send_keys(pwd)
+        # 1) Открываем страницу логина
+        driver.get("https://cabinet.nf.uust.ru")
+        driver.find_element(By.ID, "login").send_keys(login)
+        driver.find_element(By.ID, "password").send_keys(pwd)
         driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
         time.sleep(2)
 
-        # парсим бейджи
+        # 2) Переходим в «Конференции»
+        driver.get("https://cabinet.nf.uust.ru/chat/index")
+        time.sleep(2)
+
+        # 3) Считываем бейджи непрочитанных
         elems = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
         count = sum(int(e.text) for e in elems if e.text.isdigit())
-
         prev = last_counts.get(chat_id, 0)
         if count > prev:
             await context.bot.send_message(
@@ -118,16 +120,16 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
             )
             last_counts[chat_id] = count
         error_sent[chat_id] = False
+
     except Exception:
         logger.exception("Ошибка в check_messages")
         if not error_sent.get(chat_id, False):
             await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
             error_sent[chat_id] = True
-
     finally:
         driver.quit()
 
-# ——— Точка входа: сборка приложения и запуск polling ———
+# ——— Точка входа ———
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
