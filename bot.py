@@ -30,31 +30,33 @@ if not TELEGRAM_TOKEN:
     exit(1)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    # очищаем всё старое для этого чата
-    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
-        job.schedule_removal()
     await update.message.reply_text(
-        f"Ваш chat_id: {chat_id}\n"
+        f"Ваш chat_id: {update.effective_chat.id}\n"
         "Для запуска мониторинга введите:\n"
         "/set <логин> <пароль>"
     )
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     if len(context.args) != 2:
         return await update.message.reply_text("Используйте: /set <логин> <пароль>")
-    login, pwd = context.args
 
-    # создаём задачу, храня в data: (login, pwd, chat_id, last_count)
+    login, pwd = context.args
+    chat_id = update.effective_chat.id
+
+    # Отменяем предыдущие задачи для этого чата
+    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+
+    # Запускаем новую задачу, передаём login/pwd/chat_id/last через context
     context.application.job_queue.run_repeating(
-        callback=check_messages,
+        check_messages,
         interval=60,
         first=5,
         name=str(chat_id),
-        data={"login": login, "pwd": pwd, "chat_id": chat_id, "last": 0}
+        context={"login": login, "pwd": pwd, "chat_id": chat_id, "last": 0}
     )
-    await update.message.reply_text("Данные сохранены! Мониторинг запущен (каждые 60 с).")
+
+    await update.message.reply_text("Данные сохранены! Мониторинг запущен (каждые 60 сек).")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     from telegram.error import Conflict
@@ -64,13 +66,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Необработанная ошибка:", exc_info=context.error)
 
 async def check_messages(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    login = job_data["login"]
-    pwd   = job_data["pwd"]
-    chat_id = job_data["chat_id"]
-    last = job_data["last"]
+    job_ctx = context.job.context
+    login  = job_ctx["login"]
+    pwd    = job_ctx["pwd"]
+    chat_id= job_ctx["chat_id"]
+    last   = job_ctx["last"]
 
-    # Настройка headless Chrome (используем системный chromedriver из образа)
+    # Настройка headless Chrome
     opts = Options()
     opts.binary_location = "/usr/bin/chromium"
     opts.add_argument("--headless")
@@ -88,37 +90,37 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
         time.sleep(1)
 
-        # 2) Переход в раздел «Конференции»
+        # 2) Переход в чат
         chat_url = "https://cabinet.nf.uust.ru/chat/index"
         driver.get(chat_url)
-        logger.info(f"[{chat_id}] Открыл {chat_url}")
+        logger.info(f"[{chat_id}] Перешли на {chat_url}")
 
-        # 3) Сбор бейджей непрочитанных
+        # 3) Ждём появления бейджей
         WebDriverWait(driver, 10).until(
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "span.badge.room-unread"))
         )
         spans = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
 
+        # 4) Считаем только видимые цифры
         count = 0
-        for span in spans:
-            if not span.is_displayed():
+        for sp in spans:
+            if not sp.is_displayed():
                 continue
-            txt = span.text.strip()
+            txt = sp.text.strip()
             if txt.isdigit():
                 count += int(txt)
 
-        logger.info(f"[{chat_id}] Найдено непрочитанных: {count} (предыдущее — {last})")
-        # 4) Отправка уведомления только при увеличении
+        logger.info(f"[{chat_id}] Непрочитанных: {count} (предыдущее={last})")
+        # 5) Только при появлении новых
         if count > last:
-            diff = count - last
             await context.bot.send_message(
                 chat_id,
-                f"🔔 У вас {diff} новых сообщений (всего {count})."
+                f"🔔 У вас {count-last} новых сообщений (всего {count})."
             )
-            job_data["last"] = count  # обновляем в data
+            job_ctx["last"] = count
 
     except Exception:
-        logger.exception("Ошибка в check_messages")
+        logger.exception("Ошибка при check_messages")
         await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
     finally:
         driver.quit()
