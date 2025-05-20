@@ -95,6 +95,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         driver.get(chat_url)
         logger.info(f"[{chat_id}] Перешли на {chat_url}")
 
+#2
         # 3) Ждём появления бейджей
         WebDriverWait(driver, 10).until(
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "span.badge.room-unread"))
