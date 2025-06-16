@@ -124,16 +124,8 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
         driver.quit()
 
 # Запуск бота
-async def main():
+if name == "main":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("set", set_cmd))
-    await app.run_polling()
-
-if __name__ == "__main__":
-    import asyncio
-    try:
-        asyncio.run(main())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
+    app.run_polling()
