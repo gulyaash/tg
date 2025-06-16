@@ -1,143 +1,135 @@
 import os
-from dotenv import load_dotenv
-load_dotenv()
-import asyncio
+import time
 import logging
+from dotenv import load_dotenv
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    JobQueue,
 )
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 
-# 1) Простейшая настройка логирования
+# Логирование
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Загрузка токена из .env
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN не найден. Убедитесь, что он задан в .env")
+    exit(1)
+
+# Хранилища
+user_credentials: dict[int, tuple[str, str]] = {}
+last_counts: dict[int, int] = {}
+error_sent: dict[int, bool] = {}
+
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — отвечает chat_id и подсказывает синтаксис /set."""
+    chat_id = update.effective_chat.id
+    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+    user_credentials.pop(chat_id, None)
+    last_counts.pop(chat_id, None)
+    error_sent.pop(chat_id, None)
+
     await update.message.reply_text(
-        f"Ваш chat_id: {update.effective_chat.id}\n"
-        "Чтобы начать проверку, отправьте:\n"
+        f"Ваш chat_id: {chat_id}\n"
+        "Чтобы начать, отправьте:\n"
         "/set <логин> <пароль>"
     )
 
-
+# Команда /set
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Команда /set — сохраняет логин/пароль и запускает задачу,
-    которая каждую минуту вызывает check_messages().
-    """
-    if len(context.args) != 2:
-        return await update.message.reply_text("Используйте: /set логин пароль")
-
-    login, password = context.args
     chat_id = update.effective_chat.id
+    if len(context.args) != 2:
+        await update.message.reply_text("Формат: /set <логин> <пароль>")
+        return
+    login, password = context.args
+    user_credentials[chat_id] = (login, password)
+    last_counts[chat_id] = 0
+    error_sent[chat_id] = False
 
-    # Cохраняем в chat_data
-    context.chat_data["creds"] = (login, password)
-    context.chat_data["last_count"] = 0
-
-    # Удаляем предыдущую задачу (если была), чтобы не дублировать
     for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    # Регистрируем новую повторяющуюся задачу
     context.application.job_queue.run_repeating(
         check_messages,
-        interval=60,           # каждые 60 секунд
-        first=0,               # сразу после /set
-        name=str(chat_id),     # имя задачи = chat_id
-        chat_id=chat_id,       # куда шлём сообщения
+        interval=60,
+        first=0,
+        name=str(chat_id),
+        data=chat_id
     )
 
-    await update.message.reply_text("Данные сохранены! Проверка запущена каждые 60 секунд.")
+    await update.message.reply_text("Данные сохранены! Проверка каждые 60 секунд.")
 
-
+# Проверка сообщений
 async def check_messages(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Функция-джоб: логинится на сайт, парсит бейджи и отправляет
-    сообщение только если число непрочитанных увеличилось.
-    """
-    chat_id = context.job.chat_id
-
-    creds = context.chat_data.get("creds")
+    chat_id: int = context.job.data
+    creds = user_credentials.get(chat_id)
     if not creds:
-        # если логин/пароль не заданы — ничего не делаем
         return
 
     login, password = creds
-    last_count = context.chat_data.get("last_count", 0)
 
-    # Настраиваем headless Chrome
-    chrome_opts = Options()
-    chrome_opts.add_argument("--headless")
-    chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
+    options = Options()
+    options.binary_location = "/usr/bin/chromium"
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
-    # Берём автовыгружаемый chromedriver подходящей версии
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_opts)
+    service = Service("/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
 
     try:
-        driver.get("https://cabinet.nf.uust.ru/")
-        # ждём форму логина
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "username"))
-        )
-        driver.find_element(By.NAME, "username").send_keys(login)
-        driver.find_element(By.NAME, "password").send_keys(password)
-        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+        driver.get("https://cabinet.nf.uust.ru")
+        driver.find_element(By.ID, "login").send_keys(login)
+        driver.find_element(By.ID, "password").send_keys(password)
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+        time.sleep(2)
 
-        # ждём перехода в чат
-        WebDriverWait(driver, 10).until(
-            EC.url_contains("/chat/index")
-        )
+        driver.get("https://cabinet.nf.uust.ru/chat/index")
+        time.sleep(2)
 
-        # собираем все бейджи с числами
-        badges = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
-        counts = [int(el.text) for el in badges if el.text.strip().isdigit()]
-        total = sum(counts)
+        elems = driver.find_elements(By.CSS_SELECTOR, "span.badge.room-unread.pull-right")
+        count = sum(int(e.text) for e in elems if e.text.isdigit())
 
-        # если новых > 0 — присылаем разницу
-        if total > last_count:
-            diff = total - last_count
+        prev = last_counts.get(chat_id, 0)
+        if count > prev:
             await context.bot.send_message(
                 chat_id,
-                f"Обнаружено новых сообщений: {diff}"
+                f"🔔 У вас {count - prev} новых сообщений (всего {count})."
             )
-            # сохраняем текущее значение
-        context.chat_data["last_count"] = total
+            last_counts[chat_id] = count
+        error_sent[chat_id] = False
 
-    except Exception as e:
-        logger.exception("Ошибка при проверке сообщений")
-        await context.bot.send_message(chat_id, "Ошибка при проверке сообщений.")
+    except Exception:
+        logger.exception("Ошибка в check_messages")
+        if not error_sent.get(chat_id, False):
+            await context.bot.send_message(chat_id, "⚠ Ошибка при проверке сообщений.")
+            error_sent[chat_id] = True
     finally:
         driver.quit()
 
-
+# Запуск бота
 async def main():
-    # Токен берётся из переменной окружения TELEGRAM_TOKEN
-    token = os.environ["TELEGRAM_TOKEN"]
-    app = ApplicationBuilder().token(token).build()
-
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("set", set_cmd))
-
     await app.run_polling()
 
-
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
