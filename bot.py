@@ -13,33 +13,32 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    JobQueue,
 )
 
 # Логирование
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s:%(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(name)
 
 # Загрузка токена из .env
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TELEGRAM_TOKEN:
-    logger.error("TELEGRAM_TOKEN не найден. Убедитесь, что он задан в .env")
+    logger.error("TELEGRAM_TOKEN не найден в .env!")
     exit(1)
 
-# Хранилища
+# Хранилище данных
 user_credentials: dict[int, tuple[str, str]] = {}
 last_counts: dict[int, int] = {}
 error_sent: dict[int, bool] = {}
 
 # Команда /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     user_credentials.pop(chat_id, None)
     last_counts.pop(chat_id, None)
@@ -57,32 +56,33 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.message.reply_text("Формат: /set <логин> <пароль>")
         return
-    login, password = context.args
-    user_credentials[chat_id] = (login, password)
+
+    login, pwd = context.args
+    user_credentials[chat_id] = (login, pwd)
     last_counts[chat_id] = 0
     error_sent[chat_id] = False
 
-    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
 
-    context.application.job_queue.run_repeating(
-        check_messages,
+    context.job_queue.run_repeating(
+        callback=check_messages,
         interval=60,
         first=0,
         name=str(chat_id),
         data=chat_id
     )
 
-    await update.message.reply_text("Данные сохранены! Проверка каждые 60 секунд.")
+    await update.message.reply_text("✅ Данные сохранены! Проверка каждые 60 секунд.")
 
 # Проверка сообщений
 async def check_messages(context: ContextTypes.DEFAULT_TYPE):
-    chat_id: int = context.job.data
+    chat_id = context.job.data
     creds = user_credentials.get(chat_id)
     if not creds:
         return
 
-    login, password = creds
+    login, pwd = creds
 
     options = Options()
     options.binary_location = "/usr/bin/chromium"
@@ -96,7 +96,7 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     try:
         driver.get("https://cabinet.nf.uust.ru")
         driver.find_element(By.ID, "login").send_keys(login)
-        driver.find_element(By.ID, "password").send_keys(password)
+        driver.find_element(By.ID, "password").send_keys(pwd)
         driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
         time.sleep(2)
 
@@ -123,9 +123,9 @@ async def check_messages(context: ContextTypes.DEFAULT_TYPE):
     finally:
         driver.quit()
 
-# Запуск бота
-if name == "main":
+# Запуск
+if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.run_polling()
